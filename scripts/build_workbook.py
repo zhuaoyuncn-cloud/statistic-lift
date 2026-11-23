@@ -13,6 +13,7 @@ from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
 from openpyxl import load_workbook
+from openpyxl.comments import Comment
 from openpyxl.styles import Side
 from openpyxl.utils import get_column_letter
 
@@ -20,6 +21,7 @@ from report_text import SUBJECTS, class_key, lines_of, name_token, render_events
 
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "assets" / "量化表模板.xlsx"
+SHEETS = ("综合", *SUBJECTS)
 # 表体首行、宽度、模板通报区首行（如有）
 LAYOUT = {"综合": (3, 9, 18), "时政学习": (4, 14, 19), "晚自习": (3, 7, 18),
           "早操": (3, 7, 18), "宿舍卫生": (5, 10, None),
@@ -129,15 +131,56 @@ class Form:
 
 
 def score(form, row, col, entry, values, expression):
-    """正式周分优先；没有正式分时只用已核实的明细计算。"""
-    if entry.get("score") is not None:
-        val = numeric(entry["score"])
+    """独立复算明细，并在分表采用分上注明需要追溯的差异。"""
+    recalc = None
+    if values:
+        recalc = sum(values) if form.ws.title == "时政学习" else mean(values)
+
+    adopted = entry.get("score")
+    audit = entry.get("audit")
+    registered, source, reason, pending = adopted, "未提供", "", False
+    if audit is not None:
+        if not isinstance(audit, dict):
+            raise ValueError(f"{entry['class']} audit 须为对象")
+        registered = audit["registered"]
+        source = audit["source"]
+        reason = audit.get("reason", "")
+        pending = audit.get("pending", False)
+        if not isinstance(source, str) or not source.strip() or not isinstance(reason, str) or type(pending) is not bool:
+            raise ValueError(f"{entry['class']} audit 需填写来源单元格，reason 须为文字，pending 须为布尔值")
+        source, reason = source.strip(), reason.strip()
+        if pending and (adopted is None or not reason):
+            raise ValueError(f"{entry['class']} 明细待核实，需注明原因并填写已确认的采用分")
+        if registered is None and adopted is not None and not reason:
+            raise ValueError(f"{entry['class']} 原表空白，需注明采用分的补分原因和出处")
+
+    if registered is not None:
+        registered = numeric(registered)
+    differs = registered is not None and recalc is not None and not math.isclose(
+        registered, recalc, rel_tol=0, abs_tol=1e-9)
+    if adopted is not None:
+        val = numeric(adopted)
         cell = form.cell(row, col, val)
     else:
-        if not values:
+        if recalc is None:
             raise ValueError(f"{form.ws.title} {entry['class']} 缺少分数依据")
-        val = sum(values) if form.ws.title == "时政学习" else mean(values)
+        if differs and not reason:
+            raise ValueError(f"{entry['class']} 登记分与复算分不同，需说明采用复算的原因或填写正式周分")
+        val = recalc
         cell = form.formula(row, col, expression, val)
+
+    override = registered is not None and not math.isclose(registered, val, rel_tol=0, abs_tol=1e-9)
+    if differs or override or (audit is not None and (pending or reason or registered is None)):
+        registered_text = "空白" if registered is None else f"{registered:.12g}"
+        recalc_label = "复算分（按已确认明细暂算）" if pending else "复算分"
+        recalc_text = "无可复算明细" if recalc is None else f"{recalc:.12g}"
+        if not reason:
+            reason = "原表周分空白，采用明细复算分" if registered is None else "差异原因待核实"
+        note = (f"班级：{entry['class']}\n来源单元格：{source}\n登记分：{registered_text}\n"
+                f"{recalc_label}：{recalc_text}\n原因：{reason}\n本表采用值：{val:.12g}")
+        if pending:
+            note += "\n核对状态：待核实"
+        cell.comment = Comment(note, "量化分核对", width=380, height=185)
     return cell.coordinate, val
 
 
@@ -206,6 +249,7 @@ def dormitory(form, rows, roster):
         for cls in classes:
             start = r
             points, official = [], set()
+            audit = None
             for entry in groups[cls]:
                 form.cell(r, col)
                 room = form.cell(r, col + 1, entry.get("room"))
@@ -219,6 +263,10 @@ def dormitory(form, rows, roster):
                 form.cell(r, col + 4)
                 if entry.get("score") is not None:
                     official.add(numeric(entry["score"]))
+                if entry.get("audit") is not None:
+                    if audit is not None:
+                        raise ValueError(f"宿舍卫生 {cls} 的 audit 只需填写一次")
+                    audit = entry["audit"]
                 r += 1
             if len(official) > 1:
                 raise ValueError(f"宿舍卫生 {cls} 有多个班级周分")
@@ -227,8 +275,8 @@ def dormitory(form, rows, roster):
                     form.ws.merge_cells(start_row=start, start_column=c, end_row=r-1, end_column=c)
             form.cell(start, col, cls)
             letter = get_column_letter(col + 3)
-            result[cls] = score(form, start, col + 4, {"class": cls, "score": next(iter(official), None)},
-                                points, f"AVERAGE({letter}{start}:{letter}{r-1})")
+            entry = {"class": cls, "score": next(iter(official), None), "audit": audit}
+            result[cls] = score(form, start, col + 4, entry, points, f"AVERAGE({letter}{start}:{letter}{r-1})")
     mixed = list(dict.fromkeys(e["room"] for e in rows if e.get("mixed")))
     if mixed:
         row = form.ws.max_row + 1
@@ -260,6 +308,14 @@ def set_headers(wb, grade, week, issued, sections):
     return f"{issued.year}年{issued.month}月{issued.day}日"
 
 
+def get_order(data, field, allowed, *, complete=True):
+    order = data.get(field, list(allowed))
+    if (not isinstance(order, list) or any(name not in allowed for name in order)
+            or len(order) != len(set(order)) or (complete and len(order) != len(allowed))):
+        raise ValueError(f"{field} 须按需排列以下名称，每项最多出现一次：{'、'.join(allowed)}")
+    return order
+
+
 def build(data):
     grade, week = data["grade"], data["week"]
     if type(grade) is not int or not 1000 <= grade <= 9999:
@@ -270,13 +326,18 @@ def build(data):
     sections = data["sections"]
     if set(sections) != set(SUBJECTS):
         raise ValueError(f"六项单表未对齐：{set(sections) ^ set(SUBJECTS)}")
+    sheet_order = get_order(data, "sheet_order", SHEETS)
+    score_order = get_order(data, "score_order", SUBJECTS)
+    report_subjects = get_order(data, "report_subjects", SUBJECTS, complete=False)
     wb = load_workbook(TEMPLATE)
-    for index, name in enumerate(("综合", *SUBJECTS)):
+    for index, name in enumerate(sheet_order):
         wb.move_sheet(name, offset=index - wb.sheetnames.index(name))
-    wb.active = 0
+    wb.active = wb["综合"]
+    for col, subject in enumerate(score_order, 2):
+        wb["综合"].cell(2, col, subject)
     forms = {ws.title: Form(ws) for ws in wb}
     issued = set_headers(wb, grade, week, date.fromisoformat(data["issued"]), sections)
-    info, paragraphs = {}, ["通报内容："]
+    info, reports = {}, {}
     for subject in SUBJECTS:
         entry, form = sections[subject], forms[subject]
         try:
@@ -285,10 +346,14 @@ def build(data):
                 raise ValueError("成绩表中有名册以外的班级")
             handler = dormitory if subject == "宿舍卫生" else fixed_rows
             info[subject] = handler(form, rows, roster)
-            body = render_events(subject, entry["events"], roster, entry.get("problem_groups", []))
-            if form.note_style is not None:
-                form.notes(form.first + len(rows), ["备注：", *body, *entry.get("notes", [])])
-            paragraphs.extend([subject + "：", *body])
+            events = entry.get("events")
+            if events is None and subject in report_subjects:
+                raise ValueError("缺少综合通报所需记录，确认本周无问题时填写空数组")
+            body = render_events(subject, events, roster, entry.get("problem_groups", [])) if events is not None else []
+            notes = entry.get("notes", [])
+            if form.note_style is not None and (body or notes):
+                form.notes(form.first + len(rows), ["备注：", *body, *notes])
+            reports[subject] = body
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"{subject}：{error}") from error
 
@@ -296,7 +361,7 @@ def build(data):
     scores, totals = {}, {}
     for cls in roster:
         scores[cls] = [Decimal(str(info[subject][cls][1])).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
-                       for subject in SUBJECTS]
+                       for subject in score_order]
         totals[cls] = sum(scores[cls])
 
     # Python 排序是稳定的，同分时沿用名册班序。
@@ -305,7 +370,7 @@ def build(data):
     previous_total = None
     for r, cls in enumerate(ranked_classes, summary.first):
         summary.cell(r, 1, cls)
-        for col, (subject, rounded) in enumerate(zip(SUBJECTS, scores[cls]), 2):
+        for col, (subject, rounded) in enumerate(zip(score_order, scores[cls]), 2):
             addr, _ = info[subject][cls]
             summary.formula(r, col, f"ROUND('{subject}'!{addr},1)", float(rounded))
         total = totals[cls]
@@ -314,7 +379,12 @@ def build(data):
             rank = r - summary.first + 1
             previous_total = total
         summary.formula(r, 9, f"RANK(H{r},$H${summary.first}:$H${last},0)", rank)
-    footer = summary.notes(last + 1, paragraphs)
+    footer = last + 1
+    if report_subjects:
+        paragraphs = ["通报内容："]
+        for subject in report_subjects:
+            paragraphs.extend([subject + "：", *reports[subject]])
+        footer = summary.notes(footer, paragraphs)
     for r, label in enumerate(["工程机械学院", issued], footer):
         cell = summary.band(r, False, r == footer + 1)
         cell.alignment = alter(cell.alignment, horizontal="right", vertical="center")
