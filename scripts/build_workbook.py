@@ -293,20 +293,26 @@ def build(data):
             raise ValueError(f"{subject}：{error}") from error
 
     summary = forms["综合"]
-    totals = []
-    for r, cls in enumerate(roster, summary.first):
+    scores, totals = {}, {}
+    for cls in roster:
+        scores[cls] = [Decimal(str(info[subject][cls][1])).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+                       for subject in SUBJECTS]
+        totals[cls] = sum(scores[cls])
+
+    # Python 排序是稳定的，同分时沿用名册班序。
+    ranked_classes = sorted(roster, key=totals.__getitem__, reverse=True)
+    last = summary.first + len(ranked_classes) - 1
+    previous_total = None
+    for r, cls in enumerate(ranked_classes, summary.first):
         summary.cell(r, 1, cls)
-        total = Decimal(0)
-        for col, subject in enumerate(SUBJECTS, 2):
-            addr, val = info[subject][cls]
-            rounded = Decimal(str(val)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+        for col, (subject, rounded) in enumerate(zip(SUBJECTS, scores[cls]), 2):
+            addr, _ = info[subject][cls]
             summary.formula(r, col, f"ROUND('{subject}'!{addr},1)", float(rounded))
-            total += rounded
+        total = totals[cls]
         summary.formula(r, 8, f"ROUND(SUM(B{r}:G{r}),1)", float(total))
-        totals.append(total)
-    last = summary.first + len(roster) - 1
-    for r, total in enumerate(totals, summary.first):
-        rank = 1 + sum(other > total for other in totals)
+        if total != previous_total:
+            rank = r - summary.first + 1
+            previous_total = total
         summary.formula(r, 9, f"RANK(H{r},$H${summary.first}:$H${last},0)", rank)
     footer = summary.notes(last + 1, paragraphs)
     for r, label in enumerate(["工程机械学院", issued], footer):
